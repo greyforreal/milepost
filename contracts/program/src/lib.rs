@@ -246,7 +246,6 @@ pub enum Phase {
     Review,
     Settled,
     Cancelled,
-    Paused,
 }
 
 #[contracttype]
@@ -504,7 +503,19 @@ impl Programme {
     /// Put money in. Contributions close when applications do, so the budget is
     /// fixed before anyone reviews against it — a reviewer approving an amount
     /// should not have the ground move underneath them.
+    /// Reject when the programme is paused.
+    ///
+    /// Deliberately not part of `phase`: pausing is orthogonal to the deadline
+    /// timeline, and refund and sweep must keep working while paused.
+    fn require_not_paused(env: &Env) -> Result<(), Error> {
+        if env.storage().instance().get::<_, bool>(&Key::Paused) == Some(true) {
+            return Err(Error::Paused);
+        }
+        Ok(())
+    }
+
     pub fn contribute(env: Env, donor: Address, amount: i128) -> Result<(), Error> {
+        Self::require_not_paused(&env)?;
         donor.require_auth();
         Self::require_phase(&env, Phase::Open)?;
         if amount <= 0 {
@@ -546,6 +557,7 @@ impl Programme {
         requested: i128,
         metadata_hash: BytesN<32>,
     ) -> Result<(), Error> {
+        Self::require_not_paused(&env)?;
         applicant.require_auth();
         Self::require_phase(&env, Phase::Open)?;
         if requested <= 0 {
@@ -593,6 +605,7 @@ impl Programme {
         applicant: Address,
         approved: i128,
     ) -> Result<(), Error> {
+        Self::require_not_paused(&env)?;
         reviewer.require_auth();
         Self::require_phase(&env, Phase::Review)?;
         if !env
@@ -633,12 +646,11 @@ impl Programme {
                 .get(&vote_key)
                 .unwrap_or(approved);
 
-            // Find and remove the old vote from the sorted list.
-            let mut found = false;
+            // Remove one instance of the old vote, keeping sorted order. The
+            // break makes it exactly one, so no flag is needed to track it.
             for i in 0..application.votes.len() {
-                if application.votes.get(i).unwrap() == old_vote && !found {
+                if application.votes.get(i).unwrap() == old_vote {
                     application.votes.remove(i);
-                    found = true;
                     break;
                 }
             }
@@ -716,6 +728,7 @@ impl Programme {
         payee: Address,
         mode: Mode,
     ) -> Result<Award, Error> {
+        Self::require_not_paused(&env)?;
         match Self::phase(&env)? {
             Phase::Review | Phase::Settled => {}
             Phase::Cancelled => return Err(Error::Cancelled),
@@ -935,6 +948,7 @@ impl Programme {
         payee: Address,
         amount: i128,
     ) -> Result<i128, Error> {
+        Self::require_not_paused(&env)?;
         recipient.require_auth();
         let config = Self::config(&env)?;
 
@@ -993,6 +1007,7 @@ impl Programme {
         attestation: BytesN<32>,
         attester: Address,
     ) -> Result<i128, Error> {
+        Self::require_not_paused(&env)?;
         let config = Self::config(&env)?;
         if Self::phase(&env)? == Phase::Cancelled {
             return Err(Error::Cancelled);
@@ -1292,10 +1307,7 @@ impl Programme {
         }
 
         env.storage().instance().set(&Key::Paused, &true);
-        Paused {
-            by: config.creator,
-        }
-        .publish(&env);
+        Paused { by: config.creator }.publish(&env);
         Ok(())
     }
 
@@ -1310,10 +1322,7 @@ impl Programme {
         }
 
         env.storage().instance().remove(&Key::Paused);
-        Unpaused {
-            by: config.creator,
-        }
-        .publish(&env);
+        Unpaused { by: config.creator }.publish(&env);
         Ok(())
     }
 
@@ -1328,6 +1337,12 @@ impl Programme {
 
     pub fn get_config(env: Env) -> Result<ProgrammeConfig, Error> {
         Self::config(&env)
+    }
+
+    /// Whether the programme is paused. Readable so a caller can tell an
+    /// emergency stop apart from an ordinary phase refusal.
+    pub fn is_paused(env: Env) -> bool {
+        env.storage().instance().get::<_, bool>(&Key::Paused) == Some(true)
     }
 
     pub fn phase(env: &Env) -> Result<Phase, Error> {
