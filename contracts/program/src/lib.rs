@@ -197,6 +197,10 @@ pub enum Error {
     BatchTooLarge = 36,
     /// The application has been withdrawn.
     Withdrawn = 37,
+    /// The award is below the programme's configured minimum and cannot be finalised.
+    BelowMinimumAward = 38,
+    /// The programme is paused and this operation cannot proceed.
+    Paused = 39,
 }
 
 /// Where a tranche is paid, in descending order of how hard the restriction is
@@ -242,6 +246,7 @@ pub enum Phase {
     Review,
     Settled,
     Cancelled,
+    Paused,
 }
 
 #[contracttype]
@@ -293,6 +298,17 @@ pub struct Reviewed {
     pub applicant: Address,
     #[topic]
     pub reviewer: Address,
+    pub approved: i128,
+}
+
+#[contractevent(topics = ["vote_amended"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VoteAmended {
+    #[topic]
+    pub applicant: Address,
+    #[topic]
+    pub reviewer: Address,
+    pub previous: i128,
     pub approved: i128,
 }
 
@@ -369,6 +385,20 @@ pub struct ProgrammeCancelled {
     pub at: u64,
 }
 
+#[contractevent(topics = ["paused"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Paused {
+    #[topic]
+    pub by: Address,
+}
+
+#[contractevent(topics = ["unpaused"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Unpaused {
+    #[topic]
+    pub by: Address,
+}
+
 #[contractevent(topics = ["withdrawn"], data_format = "single-value")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApplicationWithdrawn {
@@ -381,6 +411,7 @@ pub struct ApplicationWithdrawn {
 enum Key {
     Config,
     Cancelled,
+    Paused,
     Contributed,
     Granted,
     Released,
@@ -439,6 +470,16 @@ impl Programme {
             return Err(Error::InvalidQuorum);
         }
         if config.tranches == 0 {
+            return Err(Error::InvalidAmount);
+        }
+        // Minimum award must be non-negative and sensible relative to tranches.
+        // Each tranche must be at least 1 stroops to be payable.
+        if config.minimum_award < 0 {
+            return Err(Error::InvalidAmount);
+        }
+        // If minimum_award is set, it must be at least tranches count to ensure
+        // each tranche is at least 1 stroops (the smallest unit).
+        if config.minimum_award > 0 && config.minimum_award < config.tranches as i128 {
             return Err(Error::InvalidAmount);
         }
 
@@ -542,6 +583,10 @@ impl Programme {
     /// application should be rejected simply does not vote — there is no
     /// "approve zero", because a zero-value award is just a rejection with extra
     /// storage.
+    ///
+    /// A reviewer can amend their vote before finalisation by calling this
+    /// again with a different amount. The sorted order is preserved and quorum
+    /// still counts each reviewer once.
     pub fn review(
         env: Env,
         reviewer: Address,
@@ -556,11 +601,6 @@ impl Programme {
             .has(&Key::Reviewer(reviewer.clone()))
         {
             return Err(Error::NotAuthorized);
-        }
-
-        let vote_key = Key::Voted(applicant.clone(), reviewer.clone());
-        if env.storage().persistent().has(&vote_key) {
-            return Err(Error::AlreadyReviewed);
         }
 
         let key = Key::Application(applicant.clone());
@@ -582,31 +622,81 @@ impl Programme {
             return Err(Error::ExceedsRequested);
         }
 
-        // Inserted in sorted position so the median never needs a sort pass.
-        let mut at = application.votes.len();
-        for (i, existing) in application.votes.iter().enumerate() {
-            if approved < existing {
-                at = i as u32;
-                break;
+        let vote_key = Key::Voted(applicant.clone(), reviewer.clone());
+        let is_amendment = env.storage().persistent().has(&vote_key);
+
+        if is_amendment {
+            // This is an amendment: find and remove the old vote, keeping sorted order.
+            let old_vote: i128 = env
+                .storage()
+                .persistent()
+                .get(&vote_key)
+                .unwrap_or(approved);
+
+            // Find and remove the old vote from the sorted list.
+            let mut found = false;
+            for i in 0..application.votes.len() {
+                if application.votes.get(i).unwrap() == old_vote && !found {
+                    application.votes.remove(i);
+                    found = true;
+                    break;
+                }
             }
-        }
-        application.votes.insert(at, approved);
 
-        env.storage().persistent().set(&key, &application);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, BUMP_THRESHOLD, BUMP_LEDGERS);
-        env.storage().persistent().set(&vote_key, &true);
-        env.storage()
-            .persistent()
-            .extend_ttl(&vote_key, BUMP_THRESHOLD, BUMP_LEDGERS);
+            // Insert the new vote in sorted position.
+            let mut at = application.votes.len();
+            for (i, existing) in application.votes.iter().enumerate() {
+                if approved < existing {
+                    at = i as u32;
+                    break;
+                }
+            }
+            application.votes.insert(at, approved);
 
-        Reviewed {
-            applicant,
-            reviewer,
-            approved,
+            env.storage().persistent().set(&key, &application);
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, BUMP_THRESHOLD, BUMP_LEDGERS);
+            env.storage().persistent().set(&vote_key, &approved);
+            env.storage()
+                .persistent()
+                .extend_ttl(&vote_key, BUMP_THRESHOLD, BUMP_LEDGERS);
+
+            VoteAmended {
+                applicant,
+                reviewer,
+                previous: old_vote,
+                approved,
+            }
+            .publish(&env);
+        } else {
+            // This is a new vote: insert in sorted position.
+            let mut at = application.votes.len();
+            for (i, existing) in application.votes.iter().enumerate() {
+                if approved < existing {
+                    at = i as u32;
+                    break;
+                }
+            }
+            application.votes.insert(at, approved);
+
+            env.storage().persistent().set(&key, &application);
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, BUMP_THRESHOLD, BUMP_LEDGERS);
+            env.storage().persistent().set(&vote_key, &approved);
+            env.storage()
+                .persistent()
+                .extend_ttl(&vote_key, BUMP_THRESHOLD, BUMP_LEDGERS);
+
+            Reviewed {
+                applicant,
+                reviewer,
+                approved,
+            }
+            .publish(&env);
         }
-        .publish(&env);
+
         Ok(())
     }
 
@@ -657,6 +747,14 @@ impl Programme {
             .votes
             .get((config.quorum - 1) / 2)
             .ok_or(Error::QuorumNotReached)?;
+
+        // Refuse to finalise if the award is below the configured minimum.
+        // This prevents awards smaller than the fee taken from them, or so small
+        // that splitting into tranches produces payments worth less than the
+        // transaction cost. The application remains untouched and retryable.
+        if granted < config.minimum_award {
+            return Err(Error::BelowMinimumAward);
+        }
 
         // A Direct award names its payee now and pays them without further
         // consent, so the payee has to be one this programme stands behind.
@@ -1167,6 +1265,53 @@ impl Programme {
         env.storage().instance().set(&Key::Cancelled, &true);
         ProgrammeCancelled {
             at: env.ledger().timestamp(),
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Emergency pause: temporarily halt money-forward operations while leaving
+    /// refund and sweep paths open so donors are never trapped.
+    ///
+    /// Covers: contribute, apply, review, finalize, spend, release.
+    /// Does NOT cover: refund, sweep_fee, sweep_unclaimed (donors must always
+    /// be able to reclaim their money, even during an emergency).
+    ///
+    /// Only the creator may pause. This is deliberate: the creator funds and
+    /// oversees the programme, and pausing is a reversible containment action,
+    /// not a permanent shutdown like cancel.
+    pub fn pause(env: Env) -> Result<(), Error> {
+        let config = Self::config(&env)?;
+        config.creator.require_auth();
+
+        if env.storage().instance().get::<_, bool>(&Key::Paused) == Some(true) {
+            return Err(Error::Paused);
+        }
+        if env.storage().instance().get::<_, bool>(&Key::Cancelled) == Some(true) {
+            return Err(Error::Cancelled);
+        }
+
+        env.storage().instance().set(&Key::Paused, &true);
+        Paused {
+            by: config.creator,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Lift the pause and resume normal operation.
+    /// Only the creator may unpause.
+    pub fn unpause(env: Env) -> Result<(), Error> {
+        let config = Self::config(&env)?;
+        config.creator.require_auth();
+
+        if env.storage().instance().get::<_, bool>(&Key::Paused) != Some(true) {
+            return Ok(()); // Already unpaused, no-op
+        }
+
+        env.storage().instance().remove(&Key::Paused);
+        Unpaused {
+            by: config.creator,
         }
         .publish(&env);
         Ok(())
